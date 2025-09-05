@@ -1,59 +1,46 @@
 # -*- coding: utf-8 -*-
-# BEST VEO3 BOT — text & photo generation + Prompt-Master
-# PTB v20+
+# BEST VEO3 BOT — text & photo generation + Prompt-Master (PTB v20+)
 
-import os, json, logging, traceback, asyncio, requests
+import os, json, logging, traceback, requests, asyncio
 from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
-from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
-)
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# ---------------- ENV & LOG ----------------
+# =============== ENV & LOG ===============
 load_dotenv()
 
 BOT_TOKEN       = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or ""
 KIE_API_KEY     = os.getenv("KIE_API_KEY", "")
 KIE_BASE_URL    = (os.getenv("KIE_BASE_URL") or "https://api.kie.ai").strip().rstrip("/")
-# главный эндпоинт генерации (мы уже нормализуем префикс /api при /v1)
-_raw_path       = (os.getenv("KIE_GENERATE_PATH") or "/api/v1/veo/generate").strip()
-
-# необязательные параметры экономии/длины, если задашь в Render
-KIE_DEFAULT_CREDITS = int(os.getenv("KIE_CREDITS", "80"))   # раньше у тебя было 80; 400 – дорого
-KIE_DEFAULT_SECONDS = os.getenv("KIE_SECONDS", "").strip()  # например "6" (строка → в int ниже)
+_raw_path       = (os.getenv("KIE_GENERATE_PATH") or os.getenv("KIE_GEN_PATH") or "/api/v1/veo/generate").strip()
 
 LOG_LEVEL       = os.getenv("LOG_LEVEL", "INFO").upper()
-
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("best-veo3")
 
 def _normalize_path(p: str) -> str:
-    """Гарантируем корректный маршрут: начинается с /api/... даже если задали /v1..."""
+    """Гарантируем корректный маршрут: начинается с /api..., даже если задали /v1..."""
     if not p.startswith("/"):
         p = "/" + p
     if p.startswith("/v1/"):
-        p = "/api" + p  # превратим /v1/... -> /api/v1/...
-    # теперь /api/v1/...
+        p = "/api" + p
+    # унифицируем популярные варианты
+    p = p.replace("//", "/")
     return p
 
 KIE_GEN_PATH = _normalize_path(_raw_path)
 
-# кандидаты для получения результата по task_id — перебираем по очереди
-RESULT_PATH_CANDIDATES = [
-    "/api/v1/tasks/{id}",           # общий
-    "/api/v1/veo/result/{id}",      # veo-специфичный
-    "/api/v1/result/{id}",          # ещё вариант
-]
+log.info("KIE endpoint: %s%s", KIE_BASE_URL, KIE_GEN_PATH)
 
-# --------------- UI: KEYBOARDS ---------------
+# =============== UI: KEYBOARDS ===============
 MAIN_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎬 Сгенерировать видео по тексту", callback_data="mode_gen_text")],
     [InlineKeyboardButton("🖼️ Сгенерировать видео по фото",  callback_data="mode_gen_photo")],
@@ -84,7 +71,7 @@ AFTER_PM_ACTIONS = InlineKeyboardMarkup([
     [InlineKeyboardButton("🖼️ Сгенерировать по фото",  callback_data="mode_gen_photo_from_pm")],
 ])
 
-# ---------------- STATE ----------------
+# =============== STATE ===============
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     if "state" not in ctx.user_data:
         ctx.user_data["state"] = {
@@ -96,7 +83,7 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
         }
     return ctx.user_data["state"]
 
-# ---------------- HELPERS ----------------
+# =============== HELPERS ===============
 def looks_like_ready_prompt(text: str) -> bool:
     if not text: return False
     if text.strip().startswith("{") and "}" in text:
@@ -136,120 +123,144 @@ SYSTEM_PM = {
     )
 }
 
-# ---------------- KIE / VEO3 ----------------
-def _post_json(url: str, payload: dict, headers: dict) -> requests.Response:
-    log.info("HTTP POST %s", url)
-    try:
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=45)
-        log.warning("KIE %s -> %s | payload=%s | body=%s", r.status_code, url, payload, r.text[:500])
-        return r
-    except Exception as e:
-        raise RuntimeError(f"Network error: {e}")
+# =============== KIE / VEO3 ===============
+KIE_FALLBACK_GEN_PATHS = [
+    KIE_GEN_PATH,                   # из ENV (нормализованный)
+    "/api/v1/generations",          # общий
+    "/v1/veo3/generations",         # старый
+]
 
-def _submit_kie(payload: dict) -> dict:
-    if not (KIE_API_KEY and KIE_BASE_URL):
-        return {"ok": False, "id": None, "error": "KIE_API_KEY или KIE_BASE_URL не заданы."}
-    headers = {"Authorization": f"Bearer {KIE_API_KEY}", "Content-Type":"application/json"}
-
-    # тихо добавим экономичные параметры, если заданы
-    if KIE_DEFAULT_CREDITS:
-        payload.setdefault("credits", KIE_DEFAULT_CREDITS)
-    if KIE_DEFAULT_SECONDS:
-        try:
-            payload.setdefault("seconds", int(KIE_DEFAULT_SECONDS))
-        except:  # если вдруг не число — пропустим
-            pass
-
-    url = f"{KIE_BASE_URL}{KIE_GEN_PATH}"
-    try:
-        r = _post_json(url, payload, headers)
-        if r.status_code == 200:
-            data = r.json() if r.text else {}
-            # попробуем достать task id из разных возможных форм
-            task_id = (
-                data.get("task_id") or data.get("taskId") or data.get("id") or
-                (data.get("data", {}) or {}).get("task_id") or
-                (data.get("data", {}) or {}).get("taskId") or
-                (data.get("result", {}) or {}).get("task_id") or
-                (data.get("result", {}) or {}).get("taskId")
-            )
-            # иногда результат приходит сразу
-            result_url = (
-                data.get("result_url") or data.get("video_url") or data.get("url") or
-                (data.get("data", {}) or {}).get("result_url")
-            )
-            return {"ok": True, "id": task_id or "unknown", "result_url": result_url, "raw": data, "error": None}
-        txt = r.text
-        if "Illegal IP" in txt or r.status_code in (401,403):
-            return {"ok": False, "id": None, "error": "Доступ API запрещён: IP Render не в whitelist Kie."}
-        return {"ok": False, "id": None, "error": f"API {r.status_code} по адресу {url}. Тело: {txt[:500]}"}
-    except Exception as e:
-        return {"ok": False, "id": None, "error": str(e)}
-
-def submit_veo_job_text(prompt: str, aspect: str) -> dict:
-    return _submit_kie({"model":"veo3","prompt":prompt,"aspect_ratio":"16:9" if aspect=="16:9" else "9:16"})
-
-def submit_veo_job_photo(image_url: str, prompt: str, aspect: str) -> dict:
-    return _submit_kie({"model":"veo3","prompt":prompt,"image_url":image_url,
-                        "aspect_ratio":"16:9" if aspect=="16:9" else "9:16"})
+def _extract_task_id(data: dict) -> Optional[str]:
+    return (
+        data.get("task_id") or data.get("taskId") or data.get("id") or
+        (data.get("data") or {}).get("task_id") or
+        (data.get("data") or {}).get("taskId") or
+        (data.get("result") or {}).get("task_id") or
+        (data.get("result") or {}).get("taskId")
+    )
 
 def _extract_result_url(data: dict) -> Optional[str]:
     return (
         data.get("result_url") or data.get("video_url") or data.get("url") or
-        (data.get("data", {}) or {}).get("result_url") or
-        (data.get("data", {}) or {}).get("video_url") or
-        (data.get("result", {}) or {}).get("url")
+        (data.get("data") or {}).get("result_url") or
+        (data.get("data") or {}).get("video_url") or
+        (data.get("result") or {}).get("url")
     )
 
+def _post_json(url: str, payload: dict, headers: dict) -> requests.Response:
+    log.info("HTTP POST %s", url)
+    r = requests.post(url, headers=headers, json=payload, timeout=45)
+    body_preview = (r.text or "")[:500]
+    log.warning("KIE %s -> %s | payload=%s | body=%s", r.status_code, url, payload, body_preview)
+    return r
+
+def _submit_kie(payload: dict) -> dict:
+    if not (KIE_API_KEY and KIE_BASE_URL):
+        return {"ok": False, "id": None, "error": "KIE_API_KEY или KIE_BASE_URL не заданы."}
+
+    headers = {"Authorization": f"Bearer {KIE_API_KEY}", "Content-Type":"application/json"}
+
+    # Если выставлены лимиты в ENV — подставим, но по умолчанию не трогаем.
+    if os.getenv("KIE_CREDITS"):
+        try: payload.setdefault("credits", int(os.getenv("KIE_CREDITS")))
+        except: pass
+    if os.getenv("KIE_SECONDS"):
+        try: payload.setdefault("seconds", int(os.getenv("KIE_SECONDS")))
+        except: pass
+
+    last_err = None
+    for path in KIE_FALLBACK_GEN_PATHS:
+        url = f"{KIE_BASE_URL}{path}"
+        try:
+            r = _post_json(url, payload, headers)
+        except Exception as e:
+            last_err = f"Network error: {e}"
+            continue
+
+        if r.status_code in (200, 201, 202):
+            try:
+                data = r.json() if r.text else {}
+            except Exception:
+                data = {}
+            task_id = _extract_task_id(data)
+            result_url = _extract_result_url(data)
+            return {"ok": True, "id": task_id or "unknown", "result_url": result_url, "raw": data, "error": None}
+
+        if r.status_code in (401, 403) or "Illegal IP" in (r.text or ""):
+            return {"ok": False, "id": None, "error": "Доступ API запрещён: IP Render не в whitelist Kie."}
+
+        if r.status_code == 404:
+            last_err = f"API 404 по адресу {url}. Тело: {(r.text or '')[:300]}"
+            continue
+
+        last_err = f"API {r.status_code} по адресу {url}. Тело: {(r.text or '')[:300]}"
+        break
+
+    return {"ok": False, "id": None, "error": last_err or "Не удалось связаться с API."}
+
+def submit_veo_job_text(prompt: str, aspect: str) -> dict:
+    return _submit_kie({
+        "model": "veo3",
+        "prompt": prompt,
+        "aspect_ratio": "16:9" if aspect == "16:9" else "9:16"
+    })
+
+def submit_veo_job_photo(image_url: str, prompt: str, aspect: str) -> dict:
+    return _submit_kie({
+        "model": "veo3",
+        "prompt": prompt,
+        "image_url": image_url,
+        "aspect_ratio": "16:9" if aspect == "16:9" else "9:16"
+    })
+
 async def poll_and_send_result(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, task_id: str):
-    """Пуллим результат KIE и отправляем как только появится."""
+    """Пуллим результат и отправляем его как только появится (мягкий фоллбэк на разные пути)."""
+    if not task_id or task_id == "unknown":
+        return
     headers = {"Authorization": f"Bearer {KIE_API_KEY}"}
     session = requests.Session()
 
-    # 45 попыток ~ 9 минут с шагом 12 сек
-    for attempt in range(45):
+    RESULT_PATH_CANDIDATES = [
+        "/api/v1/tasks/{id}",
+        "/api/v1/veo/result/{id}",
+        "/api/v1/result/{id}",
+    ]
+
+    for attempt in range(45):  # ~9 минут (45 * 12 сек)
         for tmpl in RESULT_PATH_CANDIDATES:
-            path = tmpl.format(id=task_id)
-            url = f"{KIE_BASE_URL}{path}"
+            url = f"{KIE_BASE_URL}{tmpl.format(id=task_id)}"
             try:
                 r = session.get(url, headers=headers, timeout=20)
                 log.info("HTTP GET %s -> %s", url, r.status_code)
-                if r.status_code == 200 and r.text:
+                if r.status_code in (200, 201):
                     try:
                         data = r.json()
                     except Exception:
                         data = {}
                     result_url = _extract_result_url(data)
-                    status = data.get("status") or (data.get("data", {}) or {}).get("status")
-                    # если результат готов — отправляем
+                    status = (data.get("status") or (data.get("data") or {}).get("status") or "").lower()
                     if result_url:
                         try:
                             await ctx.bot.send_video(chat_id, result_url, caption=f"✅ Готово! task_id: `{task_id}`",
                                                      parse_mode=ParseMode.MARKDOWN)
                         except Exception:
-                            # если это не прямой видео-URL, пришлём ссылкой
-                            await ctx.bot.send_message(chat_id, f"✅ Результат готов:\n{result_url}\n(task_id: `{task_id}`)",
-                                                       parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=False)
+                            await ctx.bot.send_message(chat_id, f"✅ Результат: {result_url}\n(task_id: `{task_id}`)",
+                                                       parse_mode=ParseMode.MARKDOWN)
                         return
-                    # статус "failed"
-                    if (status or "").lower() in ("failed","error"):
+                    if status in ("failed", "error"):
                         await ctx.bot.send_message(chat_id, f"❌ Генерация не удалась (task_id: `{task_id}`).",
                                                    parse_mode=ParseMode.MARKDOWN)
                         return
             except Exception as e:
-                log.warning("Polling error for %s: %s", url, e)
-                # пробуем следующий шаблон
-
+                log.warning("Polling error %s: %s", url, e)
         await asyncio.sleep(12)
 
-    # таймаут ожидания
     await ctx.bot.send_message(chat_id,
-        f"⌛ Пока нет ссылки на видео (task_id: `{task_id}`). "
-        f"Оно ещё рендерится — проверь позже в истории KIE.",
+        f"⌛ Пока нет ссылки на видео (task_id: `{task_id}`). Оно ещё рендерится — проверь позже в логах KIE.",
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ---------------- HANDLERS ----------------
+# =============== HANDLERS ===============
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     st = state(ctx); st["mode"] = None
     await update.effective_chat.send_message(
@@ -261,7 +272,7 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     st = state(ctx); data = q.data
 
-    # выбор формата
+    # выбор формата — живём в том же сообщении
     if data in ("fmt_16x9","fmt_9x16"):
         st["aspect"] = "16:9" if data == "fmt_16x9" else "9:16"
         markup = kb_run_with_format(st["aspect"]) if st.get("last_prompt") else kb_format_only(st["aspect"])
@@ -292,14 +303,16 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st.update({"mode":"prompt_master","last_image_url":None,"last_prompt":None})
         await q.edit_message_text(
             "🧠 Промпт-мастер включён. Опиши идею 1–2 фразами — **начну писать промпт**…",
-            reply_markup=None
+            reply_markup=None  # Без выбора формата в этом экране
         )
         return
 
     if data == "mode_chat":
         st["mode"] = "chat"
-        await q.edit_message_text("💬 Обычный чат. Пиши сообщения. /exit — выход.",
-                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]]))
+        await q.edit_message_text(
+            "💬 Обычный чат. Пиши сообщения. /exit — выход.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]])
+        )
         return
 
     if data == "mode_gen_text_from_pm":
@@ -323,26 +336,16 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                else submit_veo_job_text(st["last_prompt"], st["aspect"]))
         if res["ok"]:
             task_id = res.get("id") or "unknown"
-            # если KIE сразу вернул ссылку — шлём мгновенно
-            if res.get("result_url"):
-                try:
-                    await q.edit_message_text("✅ Ссылка получена, отправляю видео…")
-                    await ctx.bot.send_video(q.message.chat_id, res["result_url"],
-                                             caption=f"✅ Готово! task_id: `{task_id}`",
-                                             parse_mode=ParseMode.MARKDOWN)
-                except Exception:
-                    await ctx.bot.send_message(q.message.chat_id,
-                        f"✅ Результат: {res['result_url']}\n(task_id: `{task_id}`)",
-                        parse_mode=ParseMode.MARKDOWN)
-            else:
-                await q.edit_message_text(
-                    f"✅ Задача отправлена! ID: `{task_id}`\nОбычно рендер 2–5 минут.",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]])
-                )
-                # фоновой пуллинг результата
-                if task_id and task_id != "unknown":
-                    asyncio.create_task(poll_and_send_result(ctx, q.message.chat_id, task_id))
+            await q.edit_message_text(
+                f"✅ Задача отправлена! ID: `{task_id}`\nОбычно рендер 2–5 минут.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]])
+            )
+            # фоновый пуллинг результата
+            try:
+                ctx.application.create_task(poll_and_send_result(ctx, q.message.chat_id, task_id))
+            except Exception as e:
+                log.warning("Cannot schedule polling: %s", e)
         else:
             msg = res["error"] or "Неизвестная ошибка."
             if "whitelist" in msg or "IP" in msg:
@@ -379,9 +382,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             prompt = oai_chat([SYSTEM_PM, {"role":"user","content": text}], temperature=0.7, max_tokens=900)
             st["last_prompt"] = prompt
+
             await working.edit_text("🧠 Готовый промпт для Veo3:")
             prompt_block = f"<pre>{html_escape(prompt)}</pre>"
             await update.message.reply_html(prompt_block, disable_web_page_preview=True)
+
             await update.message.reply_text("Выбери дальнейшее действие:", reply_markup=AFTER_PM_ACTIONS)
         except Exception as e:
             await working.edit_text(f"❌ Ошибка при создании промпта: {e}")
@@ -448,7 +453,7 @@ async def error_handler(update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE
     except:
         pass
 
-# ---------------- MAIN ----------------
+# =============== MAIN ===============
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN (или BOT_TOKEN) не задан.")
@@ -466,7 +471,7 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("Bot started. KIE endpoint: %s%s", KIE_BASE_URL, KIE_GEN_PATH)
+    log.info("Bot started.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
