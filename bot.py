@@ -125,27 +125,40 @@ SYSTEM_PM = {
 
 # ---------------- KIE / VEO3 ----------------
 def _submit_kie(payload: dict) -> dict:
+    """Отправка задачи в KIE. Пытаемся и Bearer, и X-API-Key."""
     if not (KIE_API_KEY and KIE_BASE_URL):
         return {"ok": False, "id": None, "error": "KIE_API_KEY или KIE_BASE_URL не заданы."}
-    headers = {"Authorization": f"Bearer {KIE_API_KEY}", "Content-Type": "application/json"}
+
+    url = f"{KIE_BASE_URL}{KIE_GEN_PATH}"
+    # 1) Пытаемся с Bearer
+    headers_list = [
+        {"Authorization": f"Bearer {KIE_API_KEY}", "Content-Type": "application/json"},
+        {"X-API-Key": KIE_API_KEY, "Content-Type": "application/json"},
+    ]
+
+    last_txt = ""
     try:
-        r = requests.post(KIE_ENDPOINT, headers=headers, data=json.dumps(payload), timeout=30)
-        if r.status_code == 200:
-            data = r.json()
-            return {"ok": True, "id": data.get("id") or data.get("task_id") or "unknown", "error": None}
-        txt = r.text
-        if "Illegal IP" in txt or r.status_code in (401,403):
-            return {"ok": False, "id": None, "error": "Доступ API запрещён: IP Render не в whitelist Kie."}
-        return {"ok": False, "id": None, "error": f"API {r.status_code}: {txt[:300]}"}
+        for headers in headers_list:
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                return {"ok": True, "id": data.get("id") or data.get("task_id") or "unknown", "error": None}
+
+            # Запомним текст ответа и попробуем следующий вариант заголовка
+            last_txt = r.text
+            # Специальные сообщения
+            if r.status_code in (401, 403):
+                # частая причина — не в вайт-листе исходящие IP Render
+                return {"ok": False, "id": None,
+                        "error": "Доступ API запрещён (401/403). Проверьте API-ключ и whitelist исходящих IP Render в Kie."}
+            if r.status_code == 404:
+                return {"ok": False, "id": None,
+                        "error": f"API 404: проверьте маршрут {KIE_GEN_PATH} на стороне провайдера."}
+
+        # если обе попытки не дали 200
+        return {"ok": False, "id": None, "error": f"API {r.status_code}: {last_txt[:300]}"}
     except Exception as e:
         return {"ok": False, "id": None, "error": f"Network error: {e}"}
-
-def submit_veo_job_text(prompt: str, aspect: str) -> dict:
-    return _submit_kie({"model":"veo3","prompt":prompt,"aspect_ratio":"16:9" if aspect=="16:9" else "9:16"})
-
-def submit_veo_job_photo(image_url: str, prompt: str, aspect: str) -> dict:
-    return _submit_kie({"model":"veo3","prompt":prompt,"image_url":image_url,
-                        "aspect_ratio":"16:9" if aspect=="16:9" else "9:16"})
 
 # ---------------- HANDLERS ----------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
