@@ -15,7 +15,7 @@ from telegram.ext import (
 
 # ----------------- ENV & LOGGING -----------------
 load_dotenv()
-BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
+TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN", "")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENAI_KEY", "")
 KIE_API_KEY     = os.getenv("KIE_API_KEY", "")
 KIE_BASE_URL    = os.getenv("KIE_BASE_URL", "https://api.kie.ai")  # проверь в .env
