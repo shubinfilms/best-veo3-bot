@@ -1,24 +1,24 @@
 # -*- coding: utf-8 -*-
-# BEST VEO3 BOT — text + photo generation, Prompt-Master tuned
-# 2025-09-05
+# BEST VEO3 BOT — text + photo generation + Prompt-Master with typing indicator
+# 2025-09-06
 
-import os, re, json, logging, traceback, requests
+import os, json, logging, traceback, requests, asyncio
 from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
 
 # ----------------- ENV & LOGGING -----------------
 load_dotenv()
-TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENAI_KEY", "")
 KIE_API_KEY     = os.getenv("KIE_API_KEY", "")
-KIE_BASE_URL    = os.getenv("KIE_BASE_URL", "https://api.kie.ai")  # проверь в .env
+KIE_BASE_URL    = os.getenv("KIE_BASE_URL", "https://api.kie.ai")
 LOG_LEVEL       = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -53,8 +53,9 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
             "mode": None,            # gen_text | gen_photo | prompt_master | chat
             "aspect": "16:9",
             "last_prompt": None,     # текст промпта для Veo3
-            "last_image_url": None,  # Telegram file URL, если по фото
-            "chat_history": []
+            "last_image_url": None,  # Telegram file URL для фото-режима
+            "chat_history": [],
+            "_typing_stop": None     # asyncio.Event для индикации набора
         }
     return ctx.user_data["state"]
 
@@ -64,10 +65,9 @@ def looks_like_ready_prompt(text: str) -> bool:
     if text.strip().startswith("{") and "}" in text:
         return True
     score = 0
-    for kw in ["fps", "anamorphic", "85mm", "35mm", "lens", "DOF",
-               "bokeh", "rack focus", "color palette", "lighting",
-               "camera", "glide", "push-in", "tone", "sound", "subtitles",
-               "\"shot\"", "\"scene\"", "\"audio\"", "\"cinematic\""]:
+    for kw in ["fps","anamorphic","85mm","35mm","lens","DOF","bokeh","rack focus",
+               "color palette","lighting","camera","glide","push-in","tone","sound",
+               "subtitles","\"shot\"","\"scene\"","\"audio\"","\"cinematic\""]:
         if kw.lower() in text.lower():
             score += 1
     return score >= 3 or len(text) > 400
@@ -90,34 +90,22 @@ SYSTEM_PM = {
     "role": "system",
     "content": (
         "Ты — режиссёр-постановщик/промпт-сценарист для Veo3. "
-        "Не меняй идею пользователя, а усиливай её: композиция, оптика (мм/анаморф), "
-        "движение камеры (push-in, dolly, glide, rack focus), свет и палитра, темп/ритм, "
+        "Не меняй идею пользователя, усиливай её: композиция, оптика (мм/анаморф), "
+        "движение камеры (push-in, dolly, glide, rack focus), свет/палитра, темп/ритм, "
         "микро-детали (пыль, пар, блики), звук (музыка/шум/микс). "
-        "Стиль: кинематографический, живой английский, 3–6 абзацев, 500–900 символов. "
-        "Избегай воды, брендов, логотипов и субтитров."
+        "Пиши кинематографично, живым английским, 3–6 абзацев (≈500–900 симв.). "
+        "Без воды, брендов/логотипов и субтитров."
     )
 }
 
 # ----------------- Kie / Veo3 -----------------
-def submit_veo_job_text(prompt: str, aspect: str) -> dict:
-    return _submit_kie({"model":"veo3", "prompt": prompt, "aspect_ratio": "16:9" if aspect=="16:9" else "9:16"})
-
-def submit_veo_job_photo(image_url: str, prompt: str, aspect: str) -> dict:
-    # Документация Kie обычно принимает image_url + prompt. Если у тебя другой путь — поправь поля ниже.
-    payload = {
-        "model": "veo3",
-        "prompt": prompt,
-        "image_url": image_url,   # Telegram file URL, Kie скачает как референс
-        "aspect_ratio": "16:9" if aspect=="16:9" else "9:16"
-    }
-    return _submit_kie(payload)
-
 def _submit_kie(payload: dict) -> dict:
     if not (KIE_API_KEY and KIE_BASE_URL):
         return {"ok": False, "id": None, "error": "KIE_API_KEY или KIE_BASE_URL не заданы."}
     headers = {"Authorization": f"Bearer {KIE_API_KEY}", "Content-Type":"application/json"}
     try:
-        r = requests.post(f"{KIE_BASE_URL.rstrip('/')}/v1/veo3/generations", headers=headers, data=json.dumps(payload), timeout=30)
+        r = requests.post(f"{KIE_BASE_URL.rstrip('/')}/v1/veo3/generations",
+                          headers=headers, data=json.dumps(payload), timeout=30)
         if r.status_code == 200:
             data = r.json()
             return {"ok": True, "id": data.get("id") or data.get("task_id") or "unknown", "error": None}
@@ -127,6 +115,25 @@ def _submit_kie(payload: dict) -> dict:
         return {"ok": False, "id": None, "error": f"API {r.status_code}: {txt[:300]}"}
     except Exception as e:
         return {"ok": False, "id": None, "error": f"Network error: {e}"}
+
+def submit_veo_job_text(prompt: str, aspect: str) -> dict:
+    return _submit_kie({"model":"veo3", "prompt": prompt,
+                        "aspect_ratio": "16:9" if aspect=="16:9" else "9:16"})
+
+def submit_veo_job_photo(image_url: str, prompt: str, aspect: str) -> dict:
+    payload = {"model":"veo3","prompt":prompt,"image_url":image_url,
+               "aspect_ratio":"16:9" if aspect=="16:9" else "9:16"}
+    return _submit_kie(payload)
+
+# ----------------- Helpers -----------------
+async def _typing_loop(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, stop_event: asyncio.Event):
+    """Постоянно отправляет 'typing…' пока stop_event не установлен."""
+    try:
+        while not stop_event.is_set():
+            await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(4)  # Telegram показывает ~5 сек; обновляем раз в 4 сек
+    except Exception:
+        pass
 
 # ----------------- Handlers -----------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -138,7 +145,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("Выбери формат:", reply_markup=FORMAT_KB)
 
 async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     st = state(ctx); data = q.data
 
     if data == "back_menu":
@@ -152,23 +160,22 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st["mode"] = "gen_text"; st["last_image_url"] = None
         await q.edit_message_text(
             "✍️ Пришли идею **или готовый промпт**. "
-            "Готовый промпт мы не будем присылать обратно — сразу подготовим к запуску.",
+            "Готовый промпт мы не отправляем обратно — сразу подготовим к запуску.",
             reply_markup=FORMAT_KB
         ); return
 
     if data == "gen_photo":
         st["mode"] = "gen_photo"
         await q.edit_message_text(
-            "📸 Пришли **фото** с подписью (короткое описание сцены). "
-            "Если подписи нет — отправь фото, а затем текст отдельным сообщением.",
+            "📸 Пришли **фото** с подписью (краткое описание). "
+            "Если подписи нет — отправь фото, а потом текст отдельным сообщением.",
             reply_markup=FORMAT_KB
         ); return
 
     if data == "prompt_master":
         st["mode"] = "prompt_master"; st["last_image_url"] = None
         await q.edit_message_text(
-            "🧠 Промпт-мастер включён. Опиши идею 1–2 фразами — я усилю её. "
-            "⌛ Начинаю писать промпт… (20–30 сек)",
+            "🧠 Промпт-мастер включён. Опиши идею 1–2 фразами — **начну писать промпт сразу**.",
             reply_markup=FORMAT_KB
         ); return
 
@@ -205,14 +212,15 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     st = state(ctx); text = (update.message.text or "").strip()
+    chat_id = update.effective_chat.id
 
-    # CHAT
+    # CHAT режим
     if st["mode"] == "chat":
         try:
             st["chat_history"] = st.get("chat_history", [])[-8:]
             st["chat_history"].append({"role":"user","content": text})
-            answer = oai_chat([{"role":"system","content":"Ты дружелюбный ассистент. Коротко и по делу."}] + st["chat_history"],
-                              temperature=0.6, max_tokens=500)
+            answer = oai_chat([{"role":"system","content":"Ты дружелюбный ассистент. Коротко и по делу."}] +
+                              st["chat_history"], temperature=0.6, max_tokens=500)
             st["chat_history"].append({"role":"assistant","content": answer})
             await update.message.reply_text(answer)
         except Exception as e:
@@ -221,21 +229,23 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # PROMPT-MASTER
     if st["mode"] == "prompt_master":
+        # мгновенный отклик + индикатор набора
         notice = await update.message.reply_text("⌛ Начинаю писать промпт…")
+        st["_typing_stop"] = asyncio.Event()
+        asyncio.create_task(_typing_loop(chat_id, ctx, st["_typing_stop"]))
         try:
             prompt = oai_chat([SYSTEM_PM, {"role":"user","content": text}], temperature=0.7, max_tokens=900)
             st["last_prompt"] = prompt
-            await notice.edit_text(
-                "✅ Готово! Промпт создан и сохранён. Нажми «🚀 Запустить генерацию».",
-                reply_markup=RUN_KB
-            )
+            st["_typing_stop"].set()
+            await notice.edit_text("✅ Готово! Промпт создан и сохранён. Нажми «🚀 Запустить генерацию».",
+                                   reply_markup=RUN_KB)
         except Exception as e:
+            st["_typing_stop"].set()
             await notice.edit_text(f"❌ Ошибка при создании промпта: {e}")
         return
 
-    # GEN BY TEXT (ready prompt or short idea)
+    # GEN BY TEXT (готовый промпт или идея)
     if st["mode"] in (None, "gen_text", "gen_photo"):
-        # если пользователь сначала выбрал gen_photo и прислал описание без фото
         if st["mode"] == "gen_photo" and not st.get("last_image_url"):
             await update.message.reply_text("Нужно фото. Пришли изображение (с подписью — по желанию).")
             return
@@ -246,33 +256,41 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         notice = await update.message.reply_text("⌛ Формулирую кинематографический промпт…")
+        st["_typing_stop"] = asyncio.Event()
+        asyncio.create_task(_typing_loop(chat_id, ctx, st["_typing_stop"]))
         try:
             prompt = oai_chat([SYSTEM_PM, {"role":"user","content": text}], temperature=0.7, max_tokens=900)
             st["last_prompt"] = prompt
-            await notice.edit_text("✅ Промпт готов и сохранён. Нажми «🚀 Запустить генерацию».", reply_markup=RUN_KB)
+            st["_typing_stop"].set()
+            await notice.edit_text("✅ Промпт готов и сохранён. Нажми «🚀 Запустить генерацию».",
+                                   reply_markup=RUN_KB)
         except Exception as e:
+            st["_typing_stop"].set()
             await notice.edit_text(f"❌ Ошибка при подготовке промпта: {e}")
         return
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Фото как референс для Veo3. Берём самый большой размер, формируем Telegram file URL."""
-    st = state(ctx)
+    st = state(ctx); chat_id = update.effective_chat.id
     try:
         photo = update.message.photo[-1]
-        f = await update.get_bot().get_file(photo.file_id)
-        # публичная ссылка на файл Телеграма (Kie сможет скачать)
-        image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+        f = await ctx.bot.get_file(photo.file_id)
+        image_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{f.file_path}"
         st["last_image_url"] = image_url
 
-        # если есть подпись — сразу делаем промпт; иначе попросим описание
         caption = (update.message.caption or "").strip()
         if caption:
             notice = await update.message.reply_text("📸 Принял фото. ⌛ Формулирую промпт…")
+            st["_typing_stop"] = asyncio.Event()
+            asyncio.create_task(_typing_loop(chat_id, ctx, st["_typing_stop"]))
             try:
                 prompt = oai_chat([SYSTEM_PM, {"role":"user","content": caption}], temperature=0.7, max_tokens=900)
                 st["last_prompt"] = prompt
-                await notice.edit_text("✅ Фото и промпт готовы. Нажми «🚀 Запустить генерацию».", reply_markup=RUN_KB)
+                st["_typing_stop"].set()
+                await notice.edit_text("✅ Фото и промпт готовы. Нажми «🚀 Запустить генерацию».",
+                                       reply_markup=RUN_KB)
             except Exception as e:
+                st["_typing_stop"].set()
                 await notice.edit_text(f"❌ Ошибка при подготовке промпта: {e}")
         else:
             await update.message.reply_text(
@@ -293,19 +311,22 @@ async def error_handler(update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE
     try:
         if update and update.effective_chat:
             await update.effective_chat.send_message("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-    except:  # noqa
+    except:
         pass
 
 # ----------------- MAIN -----------------
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN не задан.")
-    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN не задан.")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("exit", exit_cmd))
 
-    app.add_handler(CallbackQueryHandler(cb, pattern=r"^(gen_text|gen_photo|prompt_master|chat|faq|run|back_menu|fmt_16x9|fmt_9x16)$"))
+    app.add_handler(CallbackQueryHandler(
+        cb,
+        pattern=r"^(gen_text|gen_photo|prompt_master|chat|faq|run|back_menu|fmt_16x9|fmt_9x16)$"
+    ))
 
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
