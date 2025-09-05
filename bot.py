@@ -1,46 +1,62 @@
 # -*- coding: utf-8 -*-
 # BEST VEO3 BOT — text & photo generation + Prompt-Master
-# PTB v20+
+# PTB v20+, requests
+#
+# КЛЮЧЕВЫЕ ФИШКИ:
+# - Чёткая маршрутизация KIE (BASE + PATH, безопасное склеивание)
+# - Модель ЖЁСТКО фиксирована: "veo3" (80 кредитов)
+# - Prompt-Master: показывает процесс, присылает промпт в <pre>, даёт быстрые действия
+# - Генерация по тексту/фото: «готовый промпт» не эхо-дублируется
+# - Кнопки формата 16:9 / 9:16 с иконками, Run появляется только когда есть промпт
+# - FAQ без лишних кнопок
+# - Понятные логи (URL без двойных слэшей, тело запроса без ключей)
 
-import os, json, logging, traceback, requests
+import os
+import json
+import logging
+import traceback
+import requests
 from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
-from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
-)
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# ---------------- ENV & LOG ----------------
+# ======================= ENV & LOG =======================
 load_dotenv()
 
 BOT_TOKEN       = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or ""
 KIE_API_KEY     = os.getenv("KIE_API_KEY", "")
+
+# База и путь берём из окружения и НОРМАЛИЗУЕМ
 KIE_BASE_URL    = (os.getenv("KIE_BASE_URL") or "https://api.kie.ai").strip().rstrip("/")
 _raw_path       = (os.getenv("KIE_GENERATE_PATH") or os.getenv("KIE_GEN_PATH") or "/api/v1/veo/generate").strip()
-LOG_LEVEL       = os.getenv("LOG_LEVEL", "INFO").upper()
 
+def _normalize_path(p: str) -> str:
+    """Гарантируем корректный маршрут: начинается с /api..., даже если нам задали /v1..."""
+    if not p.startswith("/"):
+        p = "/" + p
+    # если случайно указали '/v1...' — добавим префикс /api
+    if p.startswith("/v1/"):
+        p = "/api" + p
+    # если указали '/api/v1...' — уже хорошо
+    return p
+
+KIE_GENERATE_PATH = _normalize_path(_raw_path)
+
+LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("best-veo3")
 
-def _normalize_path(p: str) -> str:
-    """Гарантируем корректный маршрут: начинается с /api/... даже если задали /v1/..."""
-    if not p.startswith("/"):
-        p = "/" + p
-    if p.startswith("/v1/"):
-        p = "/api" + p
-    return p
+log.info(f"KIE endpoint: {KIE_BASE_URL}{KIE_GENERATE_PATH}")
 
-KIE_GENERATE_PATH = _normalize_path(_raw_path)
-log.info(f"KIE конечная точка: {KIE_BASE_URL}{KIE_GENERATE_PATH}")
-
-# --------------- UI: KEYBOARDS ---------------
+# ======================= UI: KEYBOARDS =======================
 MAIN_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎬 Сгенерировать видео по тексту", callback_data="mode_gen_text")],
     [InlineKeyboardButton("🖼️ Сгенерировать видео по фото",  callback_data="mode_gen_photo")],
@@ -71,7 +87,7 @@ AFTER_PM_ACTIONS = InlineKeyboardMarkup([
     [InlineKeyboardButton("🖼️ Сгенерировать по фото",  callback_data="mode_gen_photo_from_pm")],
 ])
 
-# ---------------- STATE ----------------
+# ======================= STATE =======================
 def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     if "state" not in ctx.user_data:
         ctx.user_data["state"] = {
@@ -83,7 +99,7 @@ def state(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
         }
     return ctx.user_data["state"]
 
-# ---------------- HELPERS ----------------
+# ======================= HELPERS =======================
 def looks_like_ready_prompt(text: str) -> bool:
     if not text: return False
     if text.strip().startswith("{") and "}" in text:
@@ -92,11 +108,12 @@ def looks_like_ready_prompt(text: str) -> bool:
     for kw in ["fps","anamorphic","85mm","35mm","lens","DOF","bokeh","rack focus",
                "color palette","lighting","camera","glide","push-in","tone","sound",
                "\"shot\"","\"scene\"","\"audio\"","cinematic"]:
-        if kw.lower() in text.lower(): score += 1
+        if kw.lower() in text.lower():
+            score += 1
     return score >= 3 or len(text) > 400
 
 def html_escape(s: str) -> str:
-    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 def oai_chat(messages, temperature=0.7, max_tokens=900) -> str:
     if not OPENAI_API_KEY:
@@ -123,44 +140,60 @@ SYSTEM_PM = {
     )
 }
 
-# ---------------- KIE / VEO3 ----------------
+# ======================= KIE / VEO3 =======================
+def _kie_url() -> str:
+    # надёжная склейка без двойных слэшей
+    url = f"{KIE_BASE_URL}{KIE_GENERATE_PATH}"
+    url = url.replace("://", "§§").replace("//", "/").replace("§§", "://")
+    return url
+
 def _submit_kie(payload: dict) -> dict:
+    """Единая отправка в KIE. МОДЕЛЬ ФИКСИРУЕМ: veo3 (80 кредитов)."""
     if not (KIE_API_KEY and KIE_BASE_URL):
         return {"ok": False, "id": None, "error": "KIE_API_KEY или KIE_BASE_URL не заданы."}
+
+    # принудительно фиксируем модель
+    payload = dict(payload or {})
+    payload["model"] = "veo3"
+
+    url = _kie_url()
     headers = {"Authorization": f"Bearer {KIE_API_KEY}", "Content-Type":"application/json"}
-    url = f"{KIE_BASE_URL}{KIE_GENERATE_PATH}"
+
     try:
-        log.info(f"HTTP POST {url} | payload:{json.dumps(payload, ensure_ascii=False)[:600]}")
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
-        body = r.text
-        log.info(f"KIE ответ {r.status_code} -> {url} | body:{body[:600]}")
+        log.info(f"KIE POST -> {url} | payload: {{'model':'{payload.get('model')}','aspect_ratio':'{payload.get('aspect_ratio')}',"
+                 f"'image_url':{'yes' if payload.get('image_url') else 'no'}, 'prompt_len':{len(payload.get('prompt',''))}}}")
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+
+        # Если провайдер возвращает 200 + JSON с кодом ошибки внутри — обработаем
         if r.status_code == 200:
-            data = r.json() if body else {}
-            # пробуем вытащить id из разных названий
-            task_id = (data.get("taskId") or data.get("task_id") or
-                       data.get("id") or (data.get("data") or {}).get("taskId") or
-                       "unknown")
-            return {"ok": True, "id": task_id, "error": None}
-        if r.status_code == 404:
-            return {"ok": False, "id": None, "error": f"API 404 (Not Found) по адресу {url}. Тело: {body}"}
-        if r.status_code in (401, 403):
-            return {"ok": False, "id": None, "error": "Доступ запрещён (401/403). Проверь KIE_API_KEY и whitelist IP."}
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            # часть провайдеров кладёт ошибки в тело (например, {"code":402,"msg":"insufficient credits"})
+            if isinstance(data, dict) and data.get("code") and int(data.get("code")) != 0:
+                return {"ok": False, "id": None, "error": f"API code {data.get('code')}: {data.get('msg')}"}
+            return {"ok": True, "id": data.get("taskid") or data.get("id") or data.get("task_id") or "unknown", "error": None}
+
+        # Стандартные HTTP-ошибки
+        body_preview = r.text[:400]
         if r.status_code == 402:
-            return {"ok": False, "id": None, "error": "Недостаточно кредитов в Kie AI (402). Пополните счёт."}
-        return {"ok": False, "id": None, "error": f"API {r.status_code}: {body[:300]}"}
+            return {"ok": False, "id": None, "error": "Недостаточно кредитов на KIE аккаунте."}
+        if "Illegal IP" in body_preview or r.status_code in (401, 403):
+            return {"ok": False, "id": None, "error": "Доступ API запрещён: IP платформы не в whitelist KIE."}
+
+        return {"ok": False, "id": None, "error": f"API {r.status_code}: {body_preview}"}
+
     except Exception as e:
         return {"ok": False, "id": None, "error": f"Network error: {e}"}
 
 def submit_veo_job_text(prompt: str, aspect: str) -> dict:
-    # Модель/параметры оставляем как раньше, чтобы не менять стоимость
-    return _submit_kie({"model":"veo3", "prompt":prompt,
-                        "aspect_ratio":"16:9" if aspect=="16:9" else "9:16"})
+    return _submit_kie({"prompt": prompt, "aspect_ratio": ("16:9" if aspect == "16:9" else "9:16")})
 
 def submit_veo_job_photo(image_url: str, prompt: str, aspect: str) -> dict:
-    return _submit_kie({"model":"veo3", "prompt":prompt, "image_url":image_url,
-                        "aspect_ratio":"16:9" if aspect=="16:9" else "9:16"})
+    return _submit_kie({"prompt": prompt, "image_url": image_url, "aspect_ratio": ("16:9" if aspect == "16:9" else "9:16")})
 
-# ---------------- HANDLERS ----------------
+# ======================= HANDLERS =======================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     st = state(ctx); st["mode"] = None
     await update.effective_chat.send_message(
@@ -169,16 +202,17 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     st = state(ctx); data = q.data
 
-    # выбор формата
-    if data in ("fmt_16x9","fmt_9x16"):
+    # выбор формата (в текущем сообщении)
+    if data in ("fmt_16x9", "fmt_9x16"):
         st["aspect"] = "16:9" if data == "fmt_16x9" else "9:16"
         markup = kb_run_with_format(st["aspect"]) if st.get("last_prompt") else kb_format_only(st["aspect"])
         try:
             await q.edit_message_reply_markup(reply_markup=markup)
-        except:
+        except Exception:
             pass
         return
 
@@ -187,51 +221,57 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Главное меню:", reply_markup=MAIN_MENU)
         return
 
+    # Режимы
     if data == "mode_gen_text":
-        st.update({"mode":"gen_text","last_image_url":None,"last_prompt":None})
+        st.update({"mode": "gen_text", "last_image_url": None, "last_prompt": None})
         await q.edit_message_text("✍️ Пришли идею **или готовый промпт**.\n\nВыбери формат:",
                                   reply_markup=kb_format_only(st["aspect"]))
         return
 
     if data == "mode_gen_photo":
-        st.update({"mode":"gen_photo","last_prompt":None})
+        st.update({"mode": "gen_photo", "last_prompt": None})
         await q.edit_message_text("📸 Пришли **фото** с подписью (краткое описание).\n\nВыбери формат:",
                                   reply_markup=kb_format_only(st["aspect"]))
         return
 
     if data == "mode_prompt_master":
-        st.update({"mode":"prompt_master","last_image_url":None,"last_prompt":None})
+        st.update({"mode": "prompt_master", "last_image_url": None, "last_prompt": None})
         await q.edit_message_text(
-            "🧠 Промпт-мастер включён. Опиши идею 1–2 фразами — **начну писать промпт**…",
-            reply_markup=None
+            "🧠 Промпт-мастер включён. Опиши идею 1–2 фразами — **начну писать промпт**…"
         )
         return
 
     if data == "mode_chat":
         st["mode"] = "chat"
-        await q.edit_message_text("💬 Обычный чат. Пиши сообщения. /exit — выход.",
-                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]]))
+        await q.edit_message_text(
+            "💬 Обычный чат. Пиши сообщения. /exit — выход.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]])
+        )
         return
 
+    # быстрые действия после PromptMaster
     if data == "mode_gen_text_from_pm":
         st["mode"] = "gen_text"
         await q.edit_message_text("Режим «по тексту». Измени формат ниже или жми «🚀».",
                                   reply_markup=kb_run_with_format(st["aspect"]))
         return
-
     if data == "mode_gen_photo_from_pm":
         st["mode"] = "gen_photo"
         await q.edit_message_text("Режим «по фото». Отправь изображение и подпись (если нужно).",
                                   reply_markup=kb_run_with_format(st["aspect"]))
         return
 
+    # запуск генерации
     if data == "run":
         if not st.get("last_prompt"):
-            await q.answer("Нет подготовленного промпта.", show_alert=True); return
+            await q.answer("Нет подготовленного промпта.", show_alert=True)
+            return
         await q.edit_message_text("🚀 Отправляю задачу в Veo3…")
-        res = (submit_veo_job_photo(st["last_image_url"], st["last_prompt"], st["aspect"])
-               if st["mode"]=="gen_photo" and st.get("last_image_url")
+
+        res = (submit_veo_job_photo(st.get("last_image_url"), st["last_prompt"], st["aspect"])
+               if st["mode"] == "gen_photo" and st.get("last_image_url")
                else submit_veo_job_text(st["last_prompt"], st["aspect"]))
+
         if res["ok"]:
             await q.edit_message_text(
                 f"✅ Задача отправлена! ID: `{res['id']}`\nОбычно рендер 2–5 минут.",
@@ -240,10 +280,15 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         else:
             msg = res["error"] or "Неизвестная ошибка."
-            await q.edit_message_text(f"❌ Не удалось создать задачу:\n{msg}",
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]]))
+            if "whitelist" in msg or "IP" in msg:
+                msg += "\n\n⚙️ Админу: добавьте исходящие IP хостинга в whitelist KIE."
+            await q.edit_message_text(
+                f"❌ Не удалось создать задачу:\n{msg}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]])
+            )
         return
 
+    # FAQ (без «Запустить»)
     if data == "faq":
         await q.edit_message_text(
             "📖 FAQ\n• Примеры: https://t.me/bestveo3promts\n• Форматы: 16:9 и 9:16\n"
@@ -253,25 +298,31 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    st = state(ctx); text = (update.message.text or "").strip()
+    st = state(ctx)
+    text = (update.message.text or "").strip()
 
+    # Обычный чат
     if st["mode"] == "chat":
         try:
             st["chat_history"] = st.get("chat_history", [])[-8:]
-            st["chat_history"].append({"role":"user","content": text})
-            answer = oai_chat([{"role":"system","content":"Ты дружелюбный ассистент. Коротко и по делу."}]
-                              + st["chat_history"], temperature=0.6, max_tokens=500)
-            st["chat_history"].append({"role":"assistant","content": answer})
+            st["chat_history"].append({"role": "user", "content": text})
+            answer = oai_chat(
+                [{"role": "system", "content": "Ты дружелюбный ассистент. Коротко и по делу."}] + st["chat_history"],
+                temperature=0.6, max_tokens=500
+            )
+            st["chat_history"].append({"role": "assistant", "content": answer})
             await update.message.reply_text(answer)
         except Exception as e:
             await update.message.reply_text(f"Ошибка чата: {e}")
         return
 
+    # Prompt-Master
     if st["mode"] == "prompt_master":
         working = await update.message.reply_text("⌛ Начинаю писать промпт…")
         try:
-            prompt = oai_chat([SYSTEM_PM, {"role":"user","content": text}], temperature=0.7, max_tokens=900)
+            prompt = oai_chat([SYSTEM_PM, {"role": "user", "content": text}], temperature=0.7, max_tokens=900)
             st["last_prompt"] = prompt
+
             await working.edit_text("🧠 Готовый промпт для Veo3:")
             await update.message.reply_html(f"<pre>{html_escape(prompt)}</pre>", disable_web_page_preview=True)
             await update.message.reply_text("Выбери дальнейшее действие:", reply_markup=AFTER_PM_ACTIONS)
@@ -279,6 +330,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await working.edit_text(f"❌ Ошибка при создании промпта: {e}")
         return
 
+    # Генерация по тексту/дефолт
     if st["mode"] in (None, "gen_text", "gen_photo"):
         if st["mode"] == "gen_photo" and not st.get("last_image_url"):
             await update.message.reply_text("Нужна фотография. Пришли изображение (с подписью — по желанию).")
@@ -286,13 +338,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if looks_like_ready_prompt(text):
             st["last_prompt"] = text
-            await update.message.reply_text("✅ Принял промпт. Готов к запуску.",
-                                            reply_markup=kb_run_with_format(st["aspect"]))
+            await update.message.reply_text("✅ Принял промпт. Готов к запуску.", reply_markup=kb_run_with_format(st["aspect"]))
             return
 
         working = await update.message.reply_text("⌛ Формулирую кинематографический промпт…")
         try:
-            prompt = oai_chat([SYSTEM_PM, {"role":"user","content": text}], temperature=0.7, max_tokens=900)
+            prompt = oai_chat([SYSTEM_PM, {"role": "user", "content": text}], temperature=0.7, max_tokens=900)
             st["last_prompt"] = prompt
             await working.edit_text("✅ Промпт готов и сохранён. Измени формат ниже или жми «🚀».",
                                     reply_markup=kb_run_with_format(st["aspect"]))
@@ -307,12 +358,12 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = await update.get_bot().get_file(photo.file_id)
         image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
         st["last_image_url"] = image_url
-        caption = (update.message.caption or "").strip()
 
+        caption = (update.message.caption or "").strip()
         if caption:
             working = await update.message.reply_text("📸 Фото получено. ⌛ Формулирую промпт…")
             try:
-                prompt = oai_chat([SYSTEM_PM, {"role":"user","content": caption}], temperature=0.7, max_tokens=900)
+                prompt = oai_chat([SYSTEM_PM, {"role": "user", "content": caption}], temperature=0.7, max_tokens=900)
                 st["last_prompt"] = prompt
                 await working.edit_text("✅ Фото и промпт готовы. Измени формат ниже или жми «🚀».",
                                         reply_markup=kb_run_with_format(st["aspect"]))
@@ -337,32 +388,20 @@ async def error_handler(update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE
     try:
         if update and update.effective_chat:
             await update.effective_chat.send_message("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-    except:
+    except Exception:
         pass
 
-# ---- post-init: снимаем webhook, чтобы не было 409 конфликтов ----
-async def _post_init(app: Application):
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook снят (drop_pending_updates=True). Переходим на polling.")
-    except Exception as e:
-        log.warning(f"Не удалось снять webhook: {e}")
-
-# ---------------- MAIN ----------------
+# ======================= MAIN =======================
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN (или BOT_TOKEN) не задан.")
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
 
-    app.post_init = _post_init  # <— ключевая строка для фикса 409
+    app: Application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("exit",  exit_cmd))
 
-    app.add_handler(CallbackQueryHandler(
-        cb, pattern=r"^(mode_.+|fmt_16x9|fmt_9x16|run|back_menu|faq)$"
-    ))
-
+    app.add_handler(CallbackQueryHandler(cb, pattern=r"^(mode_.+|fmt_16x9|fmt_9x16|run|back_menu|faq)$"))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
