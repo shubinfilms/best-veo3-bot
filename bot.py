@@ -23,7 +23,7 @@ OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or ""
 KIE_API_KEY     = os.getenv("KIE_API_KEY", "")
 # важно: оба значения приходят из переменных окружения и корректно склеиваются:
 KIE_BASE_URL    = (os.getenv("KIE_BASE_URL") or "https://api.kie.ai").rstrip("/")
-KIE_GEN_PATH    = os.getenv("KIE_GEN_PATH", "/api/v1/veo/generate")  # новый рабочий маршрут
+KIE_GENERATE_PATH    = os.getenv("KIE_GENERATE_PATH", "/api/v1/veo/generate")  # новый рабочий маршрут
 LOG_LEVEL       = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
