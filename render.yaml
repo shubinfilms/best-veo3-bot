@@ -1,9 +1,19 @@
 services:
-  - type: worker
-    name: best-veo3-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
-    plan: starter
-    region: frankfurt
-    autoDeploy: true
+  - name: best-veo3
+    type: worker          # Тип сервиса: worker (фоновый процесс без веб-порта)
+    env: python           # Среда выполнения: Python
+    region: frankfurt     # Регион (пример: Франкфурт в Европе)
+    plan: starter         # Тарифный план (пример: starter)
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: TELEGRAM_TOKEN
+        fromSecret: TELEGRAM_TOKEN        # токен Telegram-бота (хранится как секрет на Render)
+      - key: OPENAI_API_KEY
+        fromSecret: OPENAI_API_KEY       # API-ключ OpenAI (ChatGPT)
+      - key: KIE_API_KEY
+        fromSecret: KIE_API_KEY          # API-ключ KIE.ai (для Veo3)
+      - key: KIE_BASE_URL
+        value: "https://api.kie.ai"      # базовый URL KIE API (без завершающего слэша)
+      - key: KIE_GEN_PATH
+        value: "/api/v1/veo/generate"    # путь метода генерации видео
