@@ -534,5 +534,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# Initialize and run the bot (not shown here, ensure to add handlers and call app.run_polling())
