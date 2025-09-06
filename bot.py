@@ -24,7 +24,7 @@ BOT_TOKEN       = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or ""
 KIE_API_KEY     = os.getenv("KIE_API_KEY", "")
 KIE_BASE_URL    = (os.getenv("KIE_BASE_URL") or "https://api.kie.ai").strip().rstrip("/")
-_raw_path       = (os.getenv("KIE_GENERATE_PATH") or os.getenv("KIE_GEN_PATH") or "/api/v1/veo/generate").strip()
+_raw_path       = (os.getenv("KIE_GEN_PATH") or os.getenv("KIE_GEN_PATH") or "/api/v1/veo/generate").strip()
 
 def _normalize_path(p: str) -> str:
     """Ensure correct API path: starts with /api..., even if given as /v1..."""
