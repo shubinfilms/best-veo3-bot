@@ -2,6 +2,8 @@ services:
   - type: worker
     name: best-veo3-bot
     env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python bot.py"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: starter
+    region: frankfurt
+    autoDeploy: true
