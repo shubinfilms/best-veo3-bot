@@ -1,536 +1,353 @@
-import os
-import logging
-import requests
-import asyncio
+# -*- coding: utf-8 -*-
+# BEST VEO3 BOT — Veo3 Fast + Prompt-Master (PTB 21.6)
+# Семплы: текст/фото → KIE /api/v1/veo/generate  (model=veo3_fast)
+# 2025-09-06
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, filters, ContextTypes
+import os, json, logging, traceback, requests, asyncio
+from typing import Dict, Any, Optional
 
 from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from telegram.constants import ParseMode, ChatAction
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
+)
 
-# Загружаем переменные окружения из файла .env (если файл присутствует)
+# ----------------- ENV -----------------
 load_dotenv()
 
-# Получаем необходимые токены/ключи из окружения
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-KIE_API_KEY = os.getenv("KIE_API_KEY")
-KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai")
-KIE_GEN_PATH = os.getenv("KIE_GEN_PATH", "/api/v1/veo/generate")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+KIE_API_KEY      = os.getenv("KIE_API_KEY", "")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENAI_KEY", "")
+KIE_BASE_URL     = (os.getenv("KIE_BASE_URL") or "https://api.kie.ai").strip().rstrip("/")
+KIE_GEN_PATH_RAW = (os.getenv("KIE_GEN_PATH") or os.getenv("KIE_GENERATE_PATH") or "/api/v1/veo/generate").strip()
+PROMPTS_CHANNEL  = os.getenv("BOT_CHANNEL_URL", "https://t.me/bestveo3promts")
 
-# Формируем полный URL API для генерации видео
-KIE_GENERATE_URL = KIE_BASE_URL.rstrip("/") + KIE_GEN_PATH
-# URL для проверки статуса задачи (получение результата)
-KIE_STATUS_URL = KIE_BASE_URL.rstrip("/") + "/api/v1/veo/record-info"
+def _norm_path(p: str) -> str:
+    if not p.startswith("/"):
+        p = "/" + p
+    if p.startswith("/v1/"):
+        p = "/api" + p
+    return p
 
-# Настраиваем логирование
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+KIE_GEN_PATH = _norm_path(KIE_GEN_PATH_RAW)
 
-# Определяем константы состояний для диалогов (ConversationHandler)
-# Для генерации видео по тексту:
-T_PROMPT, T_RATIO, T_CONFIRM = range(3)
-# Для генерации видео по фото:
-P_PHOTO, P_PROMPT, P_RATIO, P_CONFIRM = range(4)
+# ----------------- LOGGING -----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+log = logging.getLogger("best-veo3-fast")
+log.info(f"KIE endpoint: {KIE_BASE_URL}{KIE_GEN_PATH}")
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обработчик команды /start. Отправляет главное меню с кнопками.
-    """
-    # Очищаем сохраненные данные пользователя (режимы и т.д.)
-    context.user_data.clear()
-    # Формируем клавиатуру главного меню
-    keyboard = [
-        [InlineKeyboardButton("🎥 Сгенерировать видео по тексту", callback_data="gen_text")],
-        [InlineKeyboardButton("🖼️ Сгенерировать видео по фото", callback_data="gen_photo")],
-        [InlineKeyboardButton("💭 Промпт-мастер (ChatGPT)", callback_data="mode_prompt")],
-        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="mode_chat")],
-        [InlineKeyboardButton("❓ FAQ", callback_data="faq"), InlineKeyboardButton("📈 Канал с промптами", url="https://t.me/your_channel")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    # Отправляем сообщение с меню (используем разметку Markdown для эмодзи, поэтому parse_mode="Markdown")
-    await update.message.reply_text("🏠 *Главное меню:*", reply_markup=reply_markup, parse_mode="Markdown")
+# ----------------- UI -----------------
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Сгенерировать видео по тексту", callback_data="gen_text")],
+        [InlineKeyboardButton("🖼️ Сгенерировать видео по фото",  callback_data="gen_photo")],
+        [InlineKeyboardButton("🧠 Промпт-мастер (ChatGPT)",       callback_data="prompt_master")],
+        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)",         callback_data="chat")],
+        [InlineKeyboardButton("❓ FAQ", callback_data="faq"),
+         InlineKeyboardButton("📈 Канал с промптами", url=PROMPTS_CHANNEL)],
+    ])
 
-async def faq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обработчик кнопки FAQ. Отправляет сообщение с часто задаваемыми вопросами.
-    """
-    # Подтверждаем нажатие кнопки, чтобы убрать «часики» на кнопке
-    await update.callback_query.answer()
-    faq_text = (
-        "❓ *FAQ:*\n"
-        "- *Что делает этот бот?* Генерирует короткие AI-видео (5–8 сек) с помощью модели Google Veo3 (через API сервиса KIE.ai).\n"
-        "- *Как пользоваться?* Выберите режим генерации: либо отправьте текстовое описание сцены, либо фото. Бот создаст видео на основе вашего запроса.\n"
-        "- *Сколько времени занимает генерация?* Около нескольких минут. Бот сообщит о прогрессе и пришлёт видео, когда оно будет готово.\n"
-        "- *Что за режим Промпт-мастер?* В этом режиме бот (ChatGPT) поможет вам составить или улучшить текстовый промпт (описание) для генерации видео.\n"
-        "- *Можно ли просто пообщаться?* Да, в режиме Обычный чат бот отвечает на любые вопросы как ChatGPT.\n"
-        "\nℹ️ *Совет:* Во время генерации видео вы можете вернуться в меню с помощью кнопки «Назад в меню». Для нового запроса используйте меню команд."
+def kb_format(aspect: str) -> InlineKeyboardMarkup:
+    b16  = f"{'✅ ' if aspect=='16:9' else ''}🎬 16:9"
+    b916 = f"{'✅ ' if aspect=='9:16' else ''}📱 9:16"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(b16,  callback_data="fmt_16x9"),
+                                  InlineKeyboardButton(b916, callback_data="fmt_9x16")]])
+
+def kb_run(aspect: str) -> InlineKeyboardMarkup:
+    b16  = f"{'✅ ' if aspect=='16:9' else ''}🎬 16:9"
+    b916 = f"{'✅ ' if aspect=='9:16' else ''}📱 9:16"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(b16,  callback_data="fmt_16x9"),
+         InlineKeyboardButton(b916, callback_data="fmt_9x16")],
+        [InlineKeyboardButton("🚀 Запустить генерацию (Veo3 Fast)", callback_data="run")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")],
+    ])
+
+# ----------------- STATE -----------------
+def st(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    if "state" not in ctx.user_data:
+        ctx.user_data["state"] = {
+            "mode": None,              # gen_text | gen_photo | prompt_master | chat
+            "aspect": "16:9",
+            "last_prompt": None,
+            "last_image_url": None,
+            "chat_history": []
+        }
+    return ctx.user_data["state"]
+
+# ----------------- PROMPT MASTER (OpenAI) -----------------
+SYSTEM_PM = {
+    "role": "system",
+    "content": (
+        "You are a senior film director and prompt-writer for Google Veo 3. "
+        "Return ONE ready-to-copy cinematic prompt in English, 500–900 characters long. "
+        "No follow-up questions. Enrich the user's idea with: composition, lens (mm/anamorphic), "
+        "camera moves (push-in, dolly, glide, rack focus), lighting & color palette, micro-details, "
+        "atmosphere, and sound cues. No brands, logos, or on-screen text. Natural, vivid, not florid."
     )
-    await update.callback_query.message.reply_text(faq_text, parse_mode="Markdown")
+}
 
-async def enter_prompt_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Вход в режим «Промпт-мастер». Настраивает режим и отправляет приветственное сообщение с кнопкой выхода.
-    """
-    await update.callback_query.answer()
-    # Устанавливаем режим «prompt»
-    context.user_data["mode"] = "prompt"
-    # Инициализируем историю сообщений для этого режима с системным сообщением (роль «system» для ChatGPT)
-    context.user_data["prompt_history"] = [
-        {"role": "system", "content": "Ты – эксперт по созданию подробных описаний (промптов) для генерации видео с помощью ИИ (Google Veo3). Помогаешь пользователю улучшить или придумать креативный промпт на основе его идей. Отвечай четко, по делу, на том же языке, на котором задан вопрос."}
-    ]
-    # Кнопка для выхода обратно в меню
-    back_button = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Назад в меню", callback_data="back_to_menu")]])
-    msg = (
-        "💡 *Режим «Промпт-мастер» активирован.* Теперь вы можете отправить идею или черновой промпт, а бот (ChatGPT) поможет сформулировать из него отличный запрос для видео.\n"
-        "_Когда захотите вернуться, нажмите кнопку ниже «Назад в меню»._"
+def oai_prompt(idea: str) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set for Prompt-Master.")
+    import openai
+    openai.api_key = OPENAI_API_KEY
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        temperature=0.7,
+        max_tokens=900,
+        messages=[SYSTEM_PM, {"role": "user", "content": idea}],
     )
-    sent_msg = await update.callback_query.message.reply_text(msg, reply_markup=back_button, parse_mode="Markdown")
-    # Сохраняем ID отправленного сообщения (чтобы при выходе убрать кнопку, если нужно)
-    context.user_data["mode_msg_id"] = sent_msg.message_id
+    return resp.choices[0].message["content"].strip()
 
-async def enter_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Вход в режим обычного чата с ChatGPT.
-    """
-    await update.callback_query.answer()
-    context.user_data["mode"] = "chat"
-    # Инициализируем историю сообщений для режима обычного чата
-    context.user_data["chat_history"] = [
-        {"role": "system", "content": "Ты — дружелюбный и полезный ассистент."}
-    ]
-    back_button = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Назад в меню", callback_data="back_to_menu")]])
-    msg = (
-        "🤖 *Режим обычного чата активирован.* Вы можете общаться с ботом (ChatGPT), задавать вопросы, бот будет отвечать как ChatGPT.\n"
-        "_Для возврата в меню нажмите кнопку «Назад в меню» ниже._"
-    )
-    sent_msg = await update.callback_query.message.reply_text(msg, reply_markup=back_button, parse_mode="Markdown")
-    context.user_data["mode_msg_id"] = sent_msg.message_id
+def html_escape(s: str) -> str:
+    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Обработчик кнопки «Назад в меню». Выход из текущего режима/диалога и показ главного меню.
-    """
-    await update.callback_query.answer()
-    # Очищаем данные пользователя (сбрасываем режим/состояние)
-    context.user_data.clear()
-    # Убираем клавиатуру у последнего сообщения (если оно было с кнопкой)
-    try:
-        await update.callback_query.edit_message_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.debug(f"Failed to edit message on back: {e}")
-    # Отправляем снова главное меню
-    keyboard = [
-        [InlineKeyboardButton("🎥 Сгенерировать видео по тексту", callback_data="gen_text")],
-        [InlineKeyboardButton("🖼️ Сгенерировать видео по фото", callback_data="gen_photo")],
-        [InlineKeyboardButton("💭 Промпт-мастер (ChatGPT)", callback_data="mode_prompt")],
-        [InlineKeyboardButton("💬 Обычный чат (ChatGPT)", callback_data="mode_chat")],
-        [InlineKeyboardButton("❓ FAQ", callback_data="faq"), InlineKeyboardButton("📈 Канал с промптами", url="https://t.me/your_channel")]
-    ]
-    await update.callback_query.message.reply_text("🏠 *Главное меню:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-    return ConversationHandler.END
+def looks_like_prompt(text: str) -> bool:
+    if not text: return False
+    score = 0
+    for kw in ["fps","lens","85mm","35mm","anamorphic","rack focus","dolly","glide",
+               "color palette","lighting","bokeh","DOF","sound","audio","score","cinematic"]:
+        if kw.lower() in text.lower():
+            score += 1
+    return score >= 2 or len(text) > 400
 
-async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Обработчик команды /cancel для отмены диалога и возврата в меню.
-    """
-    context.user_data.clear()
-    await update.message.reply_text("❌ Отменено. Возвращаемся в главное меню...")
-    # Показываем главное меню
-    await start_command(update, context)
-    return ConversationHandler.END
+# ----------------- KIE (Veo3 Fast) -----------------
+def _kie_url() -> str:
+    url = f"{KIE_BASE_URL}{KIE_GEN_PATH}"
+    url = url.replace("://","§§").replace("//","/").replace("§§","://")
+    return url
 
-async def prompt_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    (Не вызывается напрямую) Заглушка для шага ввода текста в режиме генерации по тексту.
-    """
-    return T_PROMPT
-
-async def prompt_photo_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    (Не вызывается напрямую) Заглушка для шага отправки фото в режиме генерации по фото.
-    """
-    return P_PHOTO
-
-async def gen_text_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Точка входа в диалог генерации видео по тексту. Запрашивает у пользователя текстовый промпт.
-    """
-    await update.callback_query.answer()
-    await update.callback_query.message.reply_text(
-        "✏️ *Пришлите описание видео.*\n_Напишите текст-промпт — описания сцены, персонажей, окружения и действий._\n\nℹ️ Когда закончите, вы можете отправить команду /cancel для отмены.",
-        parse_mode="Markdown"
-    )
-    return T_PROMPT
-
-async def receive_text_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Обрабатывает введённый пользователем текстовый промпт для генерации видео.
-    """
-    user_text = update.message.text.strip()
-    if not user_text:
-        await update.message.reply_text("⚠️ Описание не должно быть пустым. Введите текст ещё раз.")
-        return T_PROMPT
-    # Сохраняем промпт
-    context.user_data["prompt_text"] = user_text
-    # Предлагаем выбрать соотношение сторон видео
-    ratio_keyboard = [
-        [InlineKeyboardButton("16:9 (горизонтальное)", callback_data="ratio_16_9")],
-        [InlineKeyboardButton("9:16 (вертикальное)", callback_data="ratio_9_16")],
-        [InlineKeyboardButton("↩️ Назад в меню", callback_data="back_to_menu")]
-    ]
-    await update.message.reply_text("🖼️ *Выберите формат видео* (соотношение сторон):", reply_markup=InlineKeyboardMarkup(ratio_keyboard), parse_mode="Markdown")
-    return T_RATIO
-
-async def gen_photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Точка входа в диалог генерации видео по фото. Запрашивает у пользователя изображение.
-    """
-    await update.callback_query.answer()
-    await update.callback_query.message.reply_text(
-        "🖼️ *Пришлите изображение* для генерации видео.\nВы можете также добавить подпись к фото с описанием сцены (необязательно).\n\nℹ️ Отправьте команду /cancel для отмены.",
-        parse_mode="Markdown"
-    )
-    return P_PHOTO
-
-async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Обрабатывает полученное изображение от пользователя (в режиме генерации по фото).
-    Если у фото есть подпись, сохраняет её как текстовый промпт.
-    """
-    photo_file_id = None
-    # Telegram передаёт фото с разными размерами, берём последнее (наибольшее)
-    if update.message.photo:
-        photo_file_id = update.message.photo[-1].file_id
-    elif update.message.document and update.message.document.mime_type.startswith("image"):
-        # Если изображение прислано как документ (без сжатия)
-        photo_file_id = update.message.document.file_id
-    else:
-        await update.message.reply_text("⚠️ Это не изображение. Пожалуйста, отправьте фото.")
-        return P_PHOTO
-    # Сохраняем file_id фотографии
-    context.user_data["photo_file_id"] = photo_file_id
-    # Если у изображения была подпись (caption), используем её как текстовый промпт
-    prompt_caption = update.message.caption.strip() if update.message.caption else ""
-    if prompt_caption:
-        context.user_data["prompt_text"] = prompt_caption
-        # Получено и фото, и описание – переходим сразу к выбору формата
-        ratio_keyboard = [
-            [InlineKeyboardButton("16:9 (горизонтальное)", callback_data="ratio_16_9")],
-            [InlineKeyboardButton("9:16 (вертикальное)", callback_data="ratio_9_16")],
-            [InlineKeyboardButton("↩️ Назад в меню", callback_data="back_to_menu")]
-        ]
-        await update.message.reply_text("📄 Описание получено.\n🖼️ *Выберите формат видео*:", reply_markup=InlineKeyboardMarkup(ratio_keyboard), parse_mode="Markdown")
-        return P_RATIO
-    else:
-        # Если подписи нет, запрашиваем текстовое описание (промпт)
-        await update.message.reply_text(
-            "✏️ Теперь отправьте текстовое описание видео (промпт) или введите /skip, чтобы пропустить текстовое описание.",
-            parse_mode="Markdown"
-        )
-        return P_PROMPT
-
-async def receive_photo_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Получает текстовый промпт от пользователя после изображения (если пользователь не добавил подпись к фото).
-    """
-    user_text = update.message.text.strip()
-    # Обработка команды /skip (пропустить описание)
-    if user_text.lower() in ("/skip", "skip", "/пропустить", "пропустить"):
-        context.user_data["prompt_text"] = ""
-    else:
-        if not user_text:
-            await update.message.reply_text("⚠️ Вы отправили пустое сообщение. Введите описание или /skip для пропуска.")
-            return P_PROMPT
-        context.user_data["prompt_text"] = user_text
-    # Переходим к выбору соотношения сторон
-    ratio_keyboard = [
-        [InlineKeyboardButton("16:9 (горизонтальное)", callback_data="ratio_16_9")],
-        [InlineKeyboardButton("9:16 (вертикальное)", callback_data="ratio_9_16")],
-        [InlineKeyboardButton("↩️ Назад в меню", callback_data="back_to_menu")]
-    ]
-    await update.message.reply_text("🖼️ *Выберите формат видео*:", reply_markup=InlineKeyboardMarkup(ratio_keyboard), parse_mode="Markdown")
-    return P_RATIO
-
-async def select_ratio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Обрабатывает выбор соотношения сторон (16:9 или 9:16) и переходит к шагу подтверждения.
-    """
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    # Определяем выбранное соотношение сторон
-    aspect_ratio = "16:9" if "16_9" in data else "9:16"
-    context.user_data["aspect_ratio"] = aspect_ratio
-    # Клавиатура подтверждения запуска генерации
-    confirm_keyboard = [
-        [InlineKeyboardButton("🚀 Запустить генерацию", callback_data="confirm_start")],
-        [InlineKeyboardButton("↩️ Назад в меню", callback_data="back_to_menu")]
-    ]
-    # Формируем текст для подтверждения (обзор запроса)
-    prompt_summary = context.user_data.get("prompt_text", "")
-    photo_attached = "photo_file_id" in context.user_data
-    summary_text = "✅ *Проверьте детали перед запуском:* \n"
-    if prompt_summary:
-        summary_text += f"• *Описание:* {prompt_summary}\n"
-    if photo_attached:
-        summary_text += "• Режим: видео по изображению\n"
-    else:
-        summary_text += "• Режим: видео по тексту\n"
-    summary_text += f"• Формат видео: {aspect_ratio}\n\nНажмите «🚀 Запустить генерацию», чтобы начать."
-    await query.edit_message_text(summary_text, reply_markup=InlineKeyboardMarkup(confirm_keyboard), parse_mode="Markdown")
-    # Возвращаем соответствующее состояние подтверждения
-    return T_CONFIRM if not photo_attached else P_CONFIRM
-
-async def start_generation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Финальный шаг: отправляет запрос на генерацию видео через KIE API, отслеживает статус и высылает результат пользователю.
-    """
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    # Сообщаем пользователю, что задача принята в работу
-    await query.edit_message_text("🚀 Отправляю задачу в Veo3...")
-    # Готовим данные запроса для KIE API
-    prompt_text = context.user_data.get("prompt_text", "")
-    aspect_ratio = context.user_data.get("aspect_ratio", "16:9")
+def submit_kie(prompt: str, aspect: str, image_url: Optional[str]) -> Dict[str, Any]:
+    if not (KIE_API_KEY and KIE_BASE_URL):
+        return {"ok": False, "error": "KIE_API_KEY или KIE_BASE_URL не заданы."}
     payload = {
-        "prompt": prompt_text,
-        "model": "veo3",
-        "aspectRatio": aspect_ratio,
-        "enableFallback": True
+        "model": "veo3_fast",  # фиксируем Fast
+        "prompt": prompt,
+        "aspectRatio": "16:9" if aspect == "16:9" else "9:16"
     }
-    if "photo_file_id" in context.user_data:
-        # Если приложено изображение, получаем URL файла через Telegram API
-        file_id = context.user_data["photo_file_id"]
-        bot = context.bot
-        file = await bot.get_file(file_id)
-        file_url = file.file_path  # прямая ссылка на файл
-        # (KIE требует публично доступный URL; используем прямой URL Telegram файла)
-        payload["imageUrls"] = [file_url]
-    # Отправляем задачу на генерацию в API KIE
-    def post_request(url, headers, json):
-        try:
-            return requests.post(url, headers=headers, json=json, timeout=30)
-        except Exception as err:
-            return err
-    headers = {
-        "Authorization": f"Bearer {KIE_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    logger.info(f"Отправка запроса генерации на {KIE_GENERATE_URL}")
+    if image_url:
+        payload["imageUrls"] = [image_url]
+
+    headers = {"Authorization": f"Bearer {KIE_API_KEY}", "Content-Type": "application/json"}
+    url = _kie_url()
     try:
-        response = await asyncio.get_running_loop().run_in_executor(None, post_request, KIE_GENERATE_URL, headers, payload)
+        log.info(f"KIE POST -> {url} | aspect={payload['aspectRatio']} | img={'yes' if image_url else 'no'} | prompt_len={len(prompt)}")
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+        body = r.text
+        if r.status_code == 200:
+            try:
+                data = r.json()
+            except Exception:
+                return {"ok": False, "error": f"Bad JSON from API: {body[:300]}"}
+            # KIE обычно -> {"code":200,...,"data":{"taskId": "..."}}
+            code = int(data.get("code", 0))
+            if code == 200:
+                tid = (data.get("data") or {}).get("taskId") or data.get("taskId") or data.get("id") or "unknown"
+                return {"ok": True, "task_id": tid}
+            if code == 402:
+                return {"ok": False, "error": "Недостаточно кредитов на KIE (402)."}
+            return {"ok": False, "error": f"API code {code}: {data.get('msg') or 'Unknown'}"}
+
+        if r.status_code == 402:
+            return {"ok": False, "error": "Недостаточно кредитов на KIE (402)."}
+        if r.status_code in (401, 403) or "Illegal IP" in body:
+            return {"ok": False, "error": "Доступ API запрещён: проверьте ключ/whitelist IP."}
+        return {"ok": False, "error": f"HTTP {r.status_code}: {body[:300]}"}
     except Exception as e:
-        logger.error(f"Ошибка отправки запроса к KIE: {e}")
-        await context.bot.send_message(chat_id, "❌ Произошла ошибка при отправке запроса на генерацию. Попробуйте позже.")
-        return ConversationHandler.END
-    if isinstance(response, Exception):
-        logger.error(f"Ошибка при отправке запроса к KIE: {response}")
-        await context.bot.send_message(chat_id, "❌ Произошла ошибка при запуске генерации. Попробуйте позже.")
-        return ConversationHandler.END
+        return {"ok": False, "error": f"Network error: {e}"}
+
+# ----------------- typing indicator -----------------
+async def typing_on(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, stop: asyncio.Event):
     try:
-        result = response.json()
-    except Exception as e:
-        logger.error(f"Некорректный JSON-ответ от KIE: {e}")
-        await context.bot.send_message(chat_id, "❌ Некорректный ответ от сервиса генерации.")
-        return ConversationHandler.END
-    if result.get("code") != 200 or "data" not in result or "taskId" not in result["data"]:
-        # Запрос на генерацию завершился ошибкой
-        error_msg = result.get("msg") or "Не удалось создать задачу."
-        await context.bot.send_message(chat_id, f"❌ Ошибка запуска генерации: {error_msg}")
-        return ConversationHandler.END
-    task_id = result["data"]["taskId"]
-    logger.info(f"Video generation task created: {task_id}")
-    # Уведомляем пользователя о создании задачи и начинаем отслеживать статус
-    await context.bot.send_message(chat_id, f"📄 Задача создана. ID: `{task_id}`", parse_mode="Markdown")
-    await context.bot.send_message(chat_id, "⚙️ Генерация идёт... ⏳")
-    status_headers = {"Authorization": f"Bearer {KIE_API_KEY}"}
-    success = False
-    video_url = None
-    error_reason = None
-    elapsed = 0
-    check_interval = 5
-    next_update = 60
-    while True:
-        # Ждём перед очередной проверкой статуса
-        await asyncio.sleep(check_interval)
-        elapsed += check_interval
-        # Проверка таймаута (на случай долгой генерации)
-        if elapsed >= 600:
-            error_reason = "Превышено время ожидания генерации."
-            break
-        # Запрашиваем статус задачи
-        status_params = {"taskId": task_id}
-        def get_status(url, headers, params):
-            try:
-                return requests.get(url, headers=headers, params=params, timeout=10)
-            except Exception as err:
-                return err
-        status_response = await asyncio.get_running_loop().run_in_executor(None, get_status, KIE_STATUS_URL, status_headers, status_params)
-        if isinstance(status_response, Exception):
-            logger.warning(f"Ошибка запроса статуса: {status_response}")
-            # При временной ошибке продолжаем пытаться
-            continue
-        try:
-            status_data = status_response.json()
-        except Exception as e:
-            logger.warning(f"Некорректный ответ при проверке статуса, пропуск: {e}")
-            continue
-        if status_data.get("code") != 200 or "data" not in status_data:
-            # Непредвиденный формат ответа, пробуем снова
-            logger.debug(f"Статус-ответ: {status_data}")
-            continue
-        data = status_data["data"]
-        success_flag = data.get("successFlag")
-        if success_flag == 1:
-            # Успех – видео сгенерировано
-            success = True
-            try:
-                result_urls = data["response"]["resultUrls"]
-                if result_urls:
-                    video_url = result_urls[0]
-            except KeyError:
-                video_url = None
-            break
-        elif success_flag in (2, 3):
-            # Задача завершилась неудачей
-            error_reason = data.get("errorMessage") or "Задача не выполнена (ошибка генерации)."
-            break
+        while not stop.is_set():
+            await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(4)
+    except Exception:
+        pass
+
+# ----------------- Handlers -----------------
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = st(ctx); s["mode"] = None
+    await update.effective_chat.send_message("Главное меню:", reply_markup=main_menu())
+    await update.effective_chat.send_message("Выбери формат кадра:", reply_markup=kb_format(s["aspect"]))
+
+async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    s = st(ctx); data = q.data
+
+    if data == "back_menu":
+        s["mode"] = None
+        await q.edit_message_text("Главное меню:", reply_markup=main_menu()); return
+
+    if data.startswith("fmt_"):
+        s["aspect"] = "16:9" if data == "fmt_16x9" else "9:16"
+        await q.edit_message_text(f"✅ Формат: {s['aspect']}", reply_markup=kb_run(s["aspect"])); return
+
+    if data == "gen_text":
+        s["mode"] = "gen_text"; s["last_image_url"] = None
+        await q.edit_message_text("✍️ Пришли идею или готовый промпт (англ.).", reply_markup=kb_format(s["aspect"])); return
+
+    if data == "gen_photo":
+        s["mode"] = "gen_photo"
+        await q.edit_message_text("📸 Пришли фото (опционально добавь подпись-идею).", reply_markup=kb_format(s["aspect"])); return
+
+    if data == "prompt_master":
+        s["mode"] = "prompt_master"; s["last_image_url"] = None
+        await q.edit_message_text("🧠 Режим «Промпт-мастер» активирован. Пришли идею одной-двумя фразами — я сразу верну готовый PROMPT (EN).",
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]]))
+        return
+
+    if data == "chat":
+        s["mode"] = "chat"
+        await q.edit_message_text("💬 Обычный чат включён. /exit — выход.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]])); return
+
+    if data == "faq":
+        await q.edit_message_text("FAQ:\n• Форматы: 16:9 / 9:16\n• Модель: Veo3 Fast\n• Видео без логотипов и текста в кадре.",
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]]))
+        return
+
+    if data == "run":
+        if not s.get("last_prompt"):
+            await q.answer("Нет готового промпта.", show_alert=True); return
+        await q.edit_message_text("🚀 Отправляю задачу в Veo3 Fast…")
+        res = submit_kie(s["last_prompt"], s["aspect"], s.get("last_image_url"))
+        if res.get("ok"):
+            await q.edit_message_text(
+                f"✅ Задача создана (Veo3 Fast)! ID: `{res['task_id']}`\nОжидайте рендер.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=kb_run(s["aspect"])
+            )
         else:
-            # successFlag == 0 (ещё генерируется)
-            if elapsed >= next_update:
-                await context.bot.send_message(chat_id, f"⚙️ Генерация продолжается... {elapsed} сек")
-                next_update += 60
-            continue
-    # Генерация завершена: либо успех, либо ошибка
-    if success and video_url:
-        # Пытаемся отправить видео как файл по прямому URL
+            await q.edit_message_text(f"❌ Ошибка запуска генерации: {res.get('error')}", reply_markup=kb_run(s["aspect"]))
+        return
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = st(ctx)
+    txt = (update.message.text or "").strip()
+    chat_id = update.effective_chat.id
+
+    # CHAT
+    if s["mode"] == "chat":
+        await update.message.reply_text("Я здесь для генерации и промптов. Для идей — включи «Промпт-мастер».")
+        return
+
+    # PROMPT MASTER
+    if s["mode"] == "prompt_master":
+        notice = await update.message.reply_text("⌛ Writing your cinematic prompt…")
+        stop = asyncio.Event()
+        asyncio.create_task(typing_on(chat_id, ctx, stop))
         try:
-            await context.bot.send_video(chat_id, video=video_url, caption="🎬 Видео готово!")
+            prompt_en = oai_prompt(txt)
+            s["last_prompt"] = prompt_en
+            stop.set()
+            # показываем в <pre>, плюс появится кнопка запуска
+            await notice.edit_text(
+                f"🧠 Готовый промпт для Veo3 Fast:\n<pre>{html_escape(prompt_en)}</pre>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_run(s["aspect"])
+            )
         except Exception as e:
-            logger.error(f"Не удалось отправить видео по URL: {e}. Скачиваем и отправляем файл...")
-            # Если отправка по URL не удалась, пробуем скачать и отправить вручную
-            def download_video(url):
-                return requests.get(url, timeout=120)
-            vid_resp = await asyncio.get_running_loop().run_in_executor(None, download_video, video_url)
-            if vid_resp and vid_resp.status_code == 200:
-                await context.bot.send_video(chat_id, video=vid_resp.content, filename="veo_video.mp4", caption="🎬 Видео готово!")
-            else:
-                await context.bot.send_message(chat_id, "✅ Генерация завершена, но не удалось получить видео.")
-        # После отправки видео предлагаем вернуться в меню
-        await context.bot.send_message(chat_id, "↩️ Вернуться в меню: /start")
-    else:
-        # Генерация не удалась (или истекло время)
-        await context.bot.send_message(chat_id, f"❌ Генерация не удалась. Причина: {error_reason or 'неизвестная ошибка'}")
-        await context.bot.send_message(chat_id, "ℹ️ Вы можете изменить запрос и попробовать снова. Введите /start для возвращения в меню.")
-    return ConversationHandler.END
-
-async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обрабатывает обычные текстовые сообщения пользователя, когда активен режим чата (Prompt-master или Обычный чат).
-    """
-    mode = context.user_data.get("mode")
-    if mode not in ("prompt", "chat"):
-        # Если пользователь прислал текст вне какого-либо режима, предлагаем воспользоваться /start
-        await update.message.reply_text("ℹ️ Пожалуйста, воспользуйтесь командой /start, чтобы вернуться в меню.")
+            stop.set()
+            await notice.edit_text(f"❌ Prompt-Master error: {e}")
         return
-    user_text = update.message.text.strip()
-    if not user_text:
-        return  # пустое сообщение игнорируем
-    # Определяем историю диалога в зависимости от режима
-    if mode == "prompt":
-        history = context.user_data.get("prompt_history", [])
-    else:  # mode == "chat"
-        history = context.user_data.get("chat_history", [])
-    # Добавляем сообщение пользователя в историю
-    history.append({"role": "user", "content": user_text})
-    # Готовим запрос к OpenAI Chat Completion API
-    api_url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "gpt-3.5-turbo",
-        "messages": history
-    }
-    # Выполняем запрос к OpenAI API в отдельном потоке (чтобы не блокировать обработку бота)
-    def ask_openai(url, headers, payload):
+
+    # GEN BY TEXT / PHOTO
+    if s["mode"] in (None, "gen_text", "gen_photo"):
+        # если фото-режим, но фото нет
+        if s["mode"] == "gen_photo" and not s.get("last_image_url"):
+            await update.message.reply_text("Мне нужно фото. Пришли изображение (подпись — по желанию).")
+            return
+
+        if looks_like_prompt(txt):
+            s["last_prompt"] = txt
+            await update.message.reply_text("✅ Промпт принят. Нажми «🚀 Запустить генерацию».", reply_markup=kb_run(s["aspect"]))
+            return
+
+        # Иначе — прокачаем идею через Prompt-Master
+        notice = await update.message.reply_text("⌛ Формулирую кинематографический промпт…")
+        stop = asyncio.Event()
+        asyncio.create_task(typing_on(chat_id, ctx, stop))
         try:
-            return requests.post(url, headers=headers, json=payload, timeout=20)
-        except Exception as err:
-            return err
-    response = await asyncio.get_running_loop().run_in_executor(None, ask_openai, api_url, headers, data)
-    if isinstance(response, Exception):
-        logger.error(f"Ошибка при запросе к OpenAI: {response}")
-        await update.message.reply_text("⚠️ Не удалось получить ответ от ChatGPT. Попробуйте позже.")
-        # Удаляем последний вопрос пользователя из истории (чтобы не повторялся при следующей попытке)
-        history.pop()
+            prompt_en = oai_prompt(txt)
+            s["last_prompt"] = prompt_en
+            stop.set()
+            await notice.edit_text(
+                f"🧠 Готово. Проверь и запускай:\n<pre>{html_escape(prompt_en)}</pre>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_run(s["aspect"])
+            )
+        except Exception as e:
+            stop.set()
+            await notice.edit_text(f"❌ Ошибка при подготовке промпта: {e}")
         return
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = st(ctx); chat_id = update.effective_chat.id
     try:
-        result = response.json()
-        assistant_msg = result["choices"][0]["message"]["content"].strip()
+        photo = update.message.photo[-1]
+        f = await ctx.bot.get_file(photo.file_id)
+        s["last_image_url"] = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{f.file_path}"
+
+        caption = (update.message.caption or "").strip()
+        if caption:
+            notice = await update.message.reply_text("📸 Фото получено. ⌛ Подготавливаю промпт…")
+            stop = asyncio.Event()
+            asyncio.create_task(typing_on(chat_id, ctx, stop))
+            try:
+                prompt_en = oai_prompt(caption)
+                s["last_prompt"] = prompt_en
+                stop.set()
+                await notice.edit_text(
+                    f"✅ Фото и промпт готовы:\n<pre>{html_escape(prompt_en)}</pre>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_run(s["aspect"])
+                )
+            except Exception as e:
+                stop.set()
+                await notice.edit_text(f"❌ Ошибка при подготовке промпта: {e}")
+        else:
+            s["mode"] = "gen_photo"
+            await update.message.reply_text("📸 Фото есть. Пришли короткую идею — я сделаю промпт.",
+                                            reply_markup=kb_run(s["aspect"]))
     except Exception as e:
-        logger.error(f"Ошибка разбора ответа OpenAI: {e}")
-        await update.message.reply_text("⚠️ Ошибка при обработке ответа от ChatGPT.")
-        history.pop()
-        return
-    # Добавляем ответ ассистента в историю и отправляем его пользователю
-    history.append({"role": "assistant", "content": assistant_msg})
-    await update.message.reply_text(assistant_msg)
+        await update.message.reply_text(f"❌ Не удалось обработать фото: {e}")
 
-def main() -> None:
-    logger.info(f"KIE endpoint: {KIE_GENERATE_URL}")
-    # Создаем приложение (бота) и регистрируем обработчики
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("Ок, выхожу из режима. Открываю меню…", reply_markup=ReplyKeyboardRemove())
+    await cmd_start(update, ctx)
 
-    # Команды /start и /help
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", start_command))
-    # Диалоги генерации видео
-    conv_text = ConversationHandler(
-        entry_points=[CallbackQueryHandler(gen_text_entry, pattern="^gen_text$")],
-        states={
-            T_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text_prompt),
-                       CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$")],
-            T_RATIO: [CallbackQueryHandler(select_ratio, pattern="^ratio_"),
-                      CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$")],
-            T_CONFIRM: [CallbackQueryHandler(start_generation, pattern="^confirm_start$"),
-                        CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$")]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-        allow_reentry=False
-    )
-    conv_photo = ConversationHandler(
-        entry_points=[CallbackQueryHandler(gen_photo_entry, pattern="^gen_photo$")],
-        states={
-            P_PHOTO: [MessageHandler(~filters.COMMAND, receive_photo),
-                      CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$")],
-            P_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_photo_prompt),
-                       CommandHandler("skip", receive_photo_prompt),
-                       CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$")],
-            P_RATIO: [CallbackQueryHandler(select_ratio, pattern="^ratio_"),
-                      CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$")],
-            P_CONFIRM: [CallbackQueryHandler(start_generation, pattern="^confirm_start$"),
-                        CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$")]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-        allow_reentry=False
-    )
-    app.add_handler(conv_text)
-    app.add_handler(conv_photo)
-    # Обработчики для перехода в режимы ChatGPT и FAQ
-    app.add_handler(CallbackQueryHandler(enter_prompt_mode, pattern="^mode_prompt$"))
-    app.add_handler(CallbackQueryHandler(enter_chat_mode, pattern="^mode_chat$"))
-    app.add_handler(CallbackQueryHandler(faq_callback, pattern="^faq$"))
-    # Обработчик кнопки «Назад в меню» вне диалогов (например, в режимах чата)
-    app.add_handler(CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"))
-    # Обработчик обычных сообщений пользователя (когда активен режим чата с GPT)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message))
+async def on_error(update: Optional[Update], ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("Exception:\n%s", traceback.format_exc())
+    try:
+        if update and update.effective_chat:
+            await update.effective_chat.send_message("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
+    except:
+        pass
 
-    # Запуск бота (долгопрочное подключение с опросом обновлений)
-    app.run_polling()
+def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN is empty")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("exit",  cmd_exit))
+
+    app.add_handler(CallbackQueryHandler(cb,
+        pattern=r"^(gen_text|gen_photo|prompt_master|chat|faq|back_menu|fmt_16x9|fmt_9x16|run)$"))
+
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    app.add_error_handler(on_error)
+    log.info("Bot started (polling).")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
